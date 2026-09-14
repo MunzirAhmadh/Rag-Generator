@@ -44,7 +44,7 @@ def build_index_from_files(uploaded_files):
             all_docs = []
             file_names = []
             for uploaded_file in uploaded_files:
-                file_bytes = uploaded_file.getbuffer()
+                file_bytes = bytes(uploaded_file.getbuffer())
                 docs = load_document(file_bytes, uploaded_file.name)
                 all_docs.extend(docs)
                 file_names.append(uploaded_file.name)
