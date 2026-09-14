@@ -12,3 +12,4 @@ venv/
 *.faiss
 *.pkl
 streamlit.log
+.pytest_cache/

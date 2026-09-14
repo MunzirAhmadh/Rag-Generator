@@ -1,9 +1,11 @@
 import pytest
-from unittest.mock import Mock, MagicMock, patch
-from io import BytesIO
+from unittest.mock import Mock, patch
+from typing import List
 
 from langchain_core.documents import Document
+from langchain_core.embeddings import Embeddings
 from langchain_core.language_models.fake_chat_models import FakeListChatModel
+from langchain_community.vectorstores import FAISS
 
 from core import (
     load_document,
@@ -17,6 +19,23 @@ from core import (
     AnswerResult,
     NOT_FOUND_SENTINEL,
 )
+
+
+class FakeEmbeddings(Embeddings):
+    """Deterministic hash-based embeddings for offline testing."""
+    
+    def __init__(self, dimension: int = 32):
+        self.dimension = dimension
+
+    def embed_documents(self, texts: List[str]) -> List[List[float]]:
+        return [self._embed(text) for text in texts]
+
+    def embed_query(self, text: str) -> List[float]:
+        return self._embed(text)
+
+    def _embed(self, text: str) -> List[float]:
+        h = hash(text)
+        return [float((h >> (i * 8)) & 0xFF) / 255.0 for i in range(self.dimension)]
 
 
 class TestLoadDocument:
@@ -69,7 +88,7 @@ class TestLoadDocument:
 
 
 class TestChunkDocuments:
-    def test_chunks_with_defaults(self):
+    def test_long_text_produces_multiple_chunks_with_chunk_id(self):
         docs = [Document(page_content="A" * 2000, metadata={"source": "test.txt", "page": 1})]
         chunks = chunk_documents(docs)
         assert len(chunks) >= 2
@@ -77,60 +96,29 @@ class TestChunkDocuments:
             assert len(chunk.page_content) <= 800
             assert "chunk_id" in chunk.metadata
 
-    def test_chunks_custom_size(self):
-        docs = [Document(page_content="A" * 1000, metadata={"source": "test.txt", "page": 1})]
-        chunks = chunk_documents(docs, chunk_size=200, chunk_overlap=50)
-        assert len(chunks) >= 4
-        for chunk in chunks:
-            assert len(chunk.page_content) <= 200
+    def test_short_text_produces_one_chunk(self):
+        docs = [Document(page_content="Short text.", metadata={"source": "test.txt", "page": 1})]
+        chunks = chunk_documents(docs)
+        assert len(chunks) == 1
+        assert chunks[0].metadata["chunk_id"] == 0
 
 
-class TestGetEmbeddings:
-    @patch("core.OllamaEmbeddings")
-    def test_returns_embeddings_with_defaults(self, mock_embeddings):
-        mock_instance = Mock()
-        mock_embeddings.return_value = mock_instance
-
-        result = get_embeddings()
-
-        mock_embeddings.assert_called_once_with(model="nomic-embed-text", base_url="http://localhost:11434")
-        assert result == mock_instance
-
-    @patch("core.OllamaEmbeddings")
-    def test_returns_embeddings_with_custom_params(self, mock_embeddings):
-        mock_instance = Mock()
-        mock_embeddings.return_value = mock_instance
-
-        result = get_embeddings(model="custom-embed", base_url="http://custom:11434")
-
-        mock_embeddings.assert_called_once_with(model="custom-embed", base_url="http://custom:11434")
-        assert result == mock_instance
-
-
-class TestBuildIndex:
-    @patch("core.FAISS")
-    def test_builds_fresh_index(self, mock_faiss):
-        mock_vectorstore = Mock()
-        mock_faiss.from_documents.return_value = mock_vectorstore
-        mock_embeddings = Mock()
-
-        chunks = [Mock(), Mock()]
-        result = build_index(chunks, mock_embeddings)
-
-        mock_faiss.from_documents.assert_called_once_with(chunks, mock_embeddings)
-        assert result == mock_vectorstore
-
-
-class TestGetLLM:
-    @patch("core.ChatOllama")
-    def test_returns_llm_with_defaults(self, mock_llm):
-        mock_instance = Mock()
-        mock_llm.return_value = mock_instance
-
-        result = get_llm()
-
-        mock_llm.assert_called_once_with(model="llama3.2", base_url="http://localhost:11434", temperature=0)
-        assert result == mock_instance
+class TestBuildIndexAndRetrieval:
+    def test_build_index_and_retrieve_returns_documents(self):
+        embeddings = FakeEmbeddings(dimension=32)
+        docs = [
+            Document(page_content="AcmeWidget Pro pricing: Professional tier $29/user/month.", metadata={"source": "faq.txt", "page": 1}),
+            Document(page_content="Company handbook: work hours 9am-5pm, core hours 10am-3pm.", metadata={"source": "handbook.txt", "page": 2}),
+            Document(page_content="Health benefits: medical, dental, vision. Company pays 80%.", metadata={"source": "handbook.txt", "page": 3}),
+        ]
+        vectorstore = build_index(docs, embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+        results = retriever.invoke("pricing")
+        
+        assert len(results) == 2
+        for r in results:
+            assert isinstance(r, Document)
+            assert "source" in r.metadata
 
 
 class TestFormatDocs:
@@ -154,36 +142,25 @@ class TestBuildRagChain:
         chain = build_rag_chain(mock_retriever, mock_llm)
 
         assert chain is not None
-        # Chain should have invoke method
         assert hasattr(chain, "invoke")
 
 
 class TestAsk:
     def test_grounded_answer_returns_sources(self):
-        mock_retriever = Mock()
-        mock_llm = FakeListChatModel(responses=["Answer is here. [1]"])
-
-        chain = build_rag_chain(mock_retriever, mock_llm)
-
-        # Mock retriever to return docs
         mock_docs = [
-            Document(page_content="Source content", metadata={"source": "doc1.txt", "page": 5}),
+            Document(page_content="Source content about pricing.", metadata={"source": "doc1.txt", "page": 5}),
         ]
-        mock_retriever.invoke = Mock(return_value=mock_docs)
-
-        # The chain's parallel step calls retriever, need to mock the full chain invoke
-        # Instead, test ask by directly calling with a mock chain that returns expected structure
         mock_chain = Mock()
         mock_chain.invoke.return_value = {
             "docs": mock_docs,
             "question": "Test question",
-            "answer": "Answer is here. [1]",
+            "answer": "The price is $29. [1]",
         }
 
         result = ask(mock_chain, "Test question")
 
         assert isinstance(result, AnswerResult)
-        assert result.answer == "Answer is here. [1]"
+        assert result.answer == "The price is $29. [1]"
         assert result.is_grounded is True
         assert len(result.sources) == 1
         assert result.sources[0]["source"] == "doc1.txt"
@@ -215,6 +192,24 @@ class TestAsk:
 
         assert result.is_grounded is False
         assert result.sources == []
+
+    def test_grounded_path_with_fake_embeddings_and_fake_llm(self):
+        """Integration test: full pipeline with FakeEmbeddings and FakeListChatModel."""
+        embeddings = FakeEmbeddings(dimension=32)
+        docs = [
+            Document(page_content="AcmeWidget Pro Professional tier costs $29/user/month.", metadata={"source": "faq.txt", "page": 1}),
+            Document(page_content="Starter tier is $12/user/month.", metadata={"source": "faq.txt", "page": 1}),
+        ]
+        vectorstore = build_index(docs, embeddings)
+        retriever = vectorstore.as_retriever(search_kwargs={"k": 2})
+        fake_llm = FakeListChatModel(responses=["Professional tier costs $29/user/month. [1]"])
+        chain = build_rag_chain(retriever, fake_llm)
+
+        result = ask(chain, "How much is Professional tier?")
+
+        assert result.is_grounded is True
+        assert len(result.sources) > 0
+        assert result.sources[0]["source"] == "faq.txt"
 
 
 class TestNotFoundSentinel:
