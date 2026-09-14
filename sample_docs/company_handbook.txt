@@ -1,0 +1,21 @@
+Company Handbook
+
+Welcome to Acme Corporation! This handbook outlines our policies, benefits, and expectations for all employees.
+
+## Work Hours
+Standard work hours are 9:00 AM to 5:00 PM, Monday through Friday. Core hours are 10:00 AM to 3:00 PM when all employees are expected to be available. Flexible scheduling is available with manager approval.
+
+## Paid Time Off
+Full-time employees accrue 15 days of paid vacation per year, plus 10 paid holidays. Sick leave accrues at 1 day per month. Unused vacation rolls over up to 5 days maximum.
+
+## Remote Work Policy
+Employees may work remotely up to 2 days per week with manager approval. Fully remote positions require VP-level approval. All remote employees must be available during core hours and have a suitable workspace.
+
+## Health Benefits
+We offer comprehensive medical, dental, and vision coverage. The company pays 80% of premiums for employees and 60% for dependents. HSA contributions match up to $500/year.
+
+## Code of Conduct
+All employees are expected to treat colleagues with respect, maintain confidentiality, and act ethically. Harassment, discrimination, and retaliation are strictly prohibited and will result in disciplinary action up to termination.
+
+## Performance Reviews
+Annual performance reviews occur each March. Mid-year check-ins occur in September. Reviews assess goal achievement, core competencies, and career development.
