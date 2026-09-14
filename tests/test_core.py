@@ -1,194 +1,222 @@
 import pytest
 from unittest.mock import Mock, MagicMock, patch
+from io import BytesIO
+
+from langchain_core.documents import Document
+from langchain_core.language_models.fake_chat_models import FakeListChatModel
+
 from core import (
-    load_documents,
+    load_document,
     chunk_documents,
-    build_faiss_index,
-    create_rag_chain,
-    run_rag_query,
-    RAGPipeline,
-    RAGResult,
-    Citation,
-    NOT_FOUND_MESSAGE,
+    get_embeddings,
+    build_index,
+    get_llm,
+    format_docs,
+    build_rag_chain,
+    ask,
+    AnswerResult,
+    NOT_FOUND_SENTINEL,
 )
 
 
-class TestLoadDocuments:
-    def test_load_txt_file(self, tmp_path):
-        txt_file = tmp_path / "test.txt"
-        txt_file.write_text("Hello world\nThis is a test.")
-        docs = load_documents([str(txt_file)])
+class TestLoadDocument:
+    def test_load_txt_bytes(self):
+        content = b"Hello world\nThis is a test."
+        docs = load_document(content, "test.txt")
         assert len(docs) == 1
         assert docs[0].page_content == "Hello world\nThis is a test."
         assert docs[0].metadata["source"] == "test.txt"
         assert docs[0].metadata["page"] is None
 
-    def test_load_pdf_file(self, tmp_path):
-        pdf_file = tmp_path / "test.pdf"
-        with open(pdf_file, "wb") as f:
-            f.write(b"%PDF-1.4\n%Dummy PDF content")
+    def test_load_md_bytes(self):
+        content = b"# Header\n\nContent here."
+        docs = load_document(content, "test.md")
+        assert len(docs) == 1
+        assert docs[0].page_content == "# Header\n\nContent here."
+
+    def test_load_pdf_bytes(self):
+        content = b"%PDF-1.4 dummy"
         with patch("core.PdfReader") as mock_reader:
             mock_page = Mock()
             mock_page.extract_text.return_value = "Page 1 content"
             mock_reader.return_value.pages = [mock_page]
-            docs = load_documents([str(pdf_file)])
+            docs = load_document(content, "test.pdf")
             assert len(docs) == 1
             assert docs[0].page_content == "Page 1 content"
             assert docs[0].metadata["source"] == "test.pdf"
             assert docs[0].metadata["page"] == 1
 
+    def test_load_pdf_multiple_pages(self):
+        content = b"%PDF-1.4 dummy"
+        with patch("core.PdfReader") as mock_reader:
+            mock_page1 = Mock()
+            mock_page1.extract_text.return_value = "Page 1"
+            mock_page2 = Mock()
+            mock_page2.extract_text.return_value = "Page 2"
+            mock_reader.return_value.pages = [mock_page1, mock_page2]
+            docs = load_document(content, "test.pdf")
+            assert len(docs) == 2
+            assert docs[0].metadata["page"] == 1
+            assert docs[1].metadata["page"] == 2
+
+    def test_load_empty_returns_empty_list(self):
+        docs = load_document(b"   \n\n  ", "empty.txt")
+        assert docs == []
+
+    def test_load_unsupported_raises(self):
+        with pytest.raises(ValueError, match="Unsupported file type"):
+            load_document(b"data", "test.docx")
+
 
 class TestChunkDocuments:
-    def test_chunks_documents(self):
-        docs = [Mock(page_content="A" * 1500, metadata={"source": "test.txt", "page": 1})]
-        chunks = chunk_documents(docs, chunk_size=500, chunk_overlap=100)
+    def test_chunks_with_defaults(self):
+        docs = [Document(page_content="A" * 2000, metadata={"source": "test.txt", "page": 1})]
+        chunks = chunk_documents(docs)
         assert len(chunks) >= 2
         for chunk in chunks:
-            assert len(chunk.page_content) <= 500
+            assert len(chunk.page_content) <= 800
+            assert "chunk_id" in chunk.metadata
+
+    def test_chunks_custom_size(self):
+        docs = [Document(page_content="A" * 1000, metadata={"source": "test.txt", "page": 1})]
+        chunks = chunk_documents(docs, chunk_size=200, chunk_overlap=50)
+        assert len(chunks) >= 4
+        for chunk in chunks:
+            assert len(chunk.page_content) <= 200
 
 
-class TestBuildFaissIndex:
+class TestGetEmbeddings:
     @patch("core.OllamaEmbeddings")
+    def test_returns_embeddings_with_defaults(self, mock_embeddings):
+        mock_instance = Mock()
+        mock_embeddings.return_value = mock_instance
+
+        result = get_embeddings()
+
+        mock_embeddings.assert_called_once_with(model="nomic-embed-text", base_url="http://localhost:11434")
+        assert result == mock_instance
+
+    @patch("core.OllamaEmbeddings")
+    def test_returns_embeddings_with_custom_params(self, mock_embeddings):
+        mock_instance = Mock()
+        mock_embeddings.return_value = mock_instance
+
+        result = get_embeddings(model="custom-embed", base_url="http://custom:11434")
+
+        mock_embeddings.assert_called_once_with(model="custom-embed", base_url="http://custom:11434")
+        assert result == mock_instance
+
+
+class TestBuildIndex:
     @patch("core.FAISS")
-    def test_builds_index(self, mock_faiss, mock_embeddings):
-        mock_embeddings_instance = Mock()
-        mock_embeddings.return_value = mock_embeddings_instance
+    def test_builds_fresh_index(self, mock_faiss):
         mock_vectorstore = Mock()
         mock_faiss.from_documents.return_value = mock_vectorstore
+        mock_embeddings = Mock()
 
-        docs = [Mock(page_content="test", metadata={})]
-        result = build_faiss_index(docs, "test-model")
+        chunks = [Mock(), Mock()]
+        result = build_index(chunks, mock_embeddings)
 
-        mock_embeddings.assert_called_once_with(model="test-model")
-        mock_faiss.from_documents.assert_called_once_with(docs, mock_embeddings_instance)
+        mock_faiss.from_documents.assert_called_once_with(chunks, mock_embeddings)
         assert result == mock_vectorstore
 
 
-class TestCreateRagChain:
-    def test_creates_chain_with_retriever(self):
-        mock_vectorstore = Mock()
+class TestGetLLM:
+    @patch("core.ChatOllama")
+    def test_returns_llm_with_defaults(self, mock_llm):
+        mock_instance = Mock()
+        mock_llm.return_value = mock_instance
+
+        result = get_llm()
+
+        mock_llm.assert_called_once_with(model="llama3.2", base_url="http://localhost:11434", temperature=0)
+        assert result == mock_instance
+
+
+class TestFormatDocs:
+    def test_formats_docs_with_numbers_and_metadata(self):
+        docs = [
+            Document(page_content="Content one", metadata={"source": "a.txt", "page": 1}),
+            Document(page_content="Content two", metadata={"source": "b.txt", "page": None}),
+        ]
+        result = format_docs(docs)
+        assert "[1] Source: a.txt, page 1" in result
+        assert "Content one" in result
+        assert "[2] Source: b.txt" in result
+        assert "Content two" in result
+
+
+class TestBuildRagChain:
+    def test_creates_chain_with_runnable_parallel(self):
         mock_retriever = Mock()
-        mock_vectorstore.as_retriever.return_value = mock_retriever
+        mock_llm = Mock()
 
-        chain = create_rag_chain(mock_vectorstore, "test-model")
+        chain = build_rag_chain(mock_retriever, mock_llm)
 
-        mock_vectorstore.as_retriever.assert_called_once_with(search_kwargs={"k": 4})
         assert chain is not None
+        # Chain should have invoke method
+        assert hasattr(chain, "invoke")
 
 
-class TestRunRagQuery:
-    def test_returns_grounded_result(self):
+class TestAsk:
+    def test_grounded_answer_returns_sources(self):
+        mock_retriever = Mock()
+        mock_llm = FakeListChatModel(responses=["Answer is here. [1]"])
+
+        chain = build_rag_chain(mock_retriever, mock_llm)
+
+        # Mock retriever to return docs
+        mock_docs = [
+            Document(page_content="Source content", metadata={"source": "doc1.txt", "page": 5}),
+        ]
+        mock_retriever.invoke = Mock(return_value=mock_docs)
+
+        # The chain's parallel step calls retriever, need to mock the full chain invoke
+        # Instead, test ask by directly calling with a mock chain that returns expected structure
         mock_chain = Mock()
         mock_chain.invoke.return_value = {
-            "answer": "The answer is 42.",
-            "citations": [
-                Citation(filename="doc1.txt", page=1, snippet="The answer is 42..."),
-            ],
+            "docs": mock_docs,
+            "question": "Test question",
+            "answer": "Answer is here. [1]",
         }
 
-        result = run_rag_query(mock_chain, "What is the answer?")
+        result = ask(mock_chain, "Test question")
 
-        assert isinstance(result, RAGResult)
-        assert result.answer == "The answer is 42."
+        assert isinstance(result, AnswerResult)
+        assert result.answer == "Answer is here. [1]"
         assert result.is_grounded is True
-        assert len(result.citations) == 1
+        assert len(result.sources) == 1
+        assert result.sources[0]["source"] == "doc1.txt"
+        assert result.sources[0]["page"] == 5
 
-    def test_returns_not_found_result(self):
+    def test_not_found_returns_empty_sources(self):
         mock_chain = Mock()
         mock_chain.invoke.return_value = {
-            "answer": NOT_FOUND_MESSAGE,
-            "citations": [],
+            "docs": [],
+            "question": "Unknown question",
+            "answer": NOT_FOUND_SENTINEL,
         }
 
-        result = run_rag_query(mock_chain, "Unknown question")
+        result = ask(mock_chain, "Unknown question")
 
-        assert result.answer == NOT_FOUND_MESSAGE
+        assert result.answer == NOT_FOUND_SENTINEL
         assert result.is_grounded is False
-        assert result.citations == []
+        assert result.sources == []
 
-    def test_not_found_with_extra_whitespace(self):
+    def test_not_found_substring_triggers_false(self):
         mock_chain = Mock()
         mock_chain.invoke.return_value = {
-            "answer": f"  {NOT_FOUND_MESSAGE}  ",
-            "citations": [],
+            "docs": [],
+            "question": "Unknown question",
+            "answer": f"Sorry, {NOT_FOUND_SENTINEL}",
         }
 
-        result = run_rag_query(mock_chain, "Unknown question")
+        result = ask(mock_chain, "Unknown question")
 
         assert result.is_grounded is False
+        assert result.sources == []
 
 
-class TestRAGPipeline:
-    @patch("core.build_faiss_index")
-    @patch("core.chunk_documents")
-    @patch("core.load_documents")
-    def test_build_index(self, mock_load, mock_chunk, mock_build):
-        mock_load.return_value = [Mock()]
-        mock_chunk.return_value = [Mock()]
-        mock_vectorstore = Mock()
-        mock_build.return_value = mock_vectorstore
-
-        pipeline = RAGPipeline()
-        pipeline.build_index(["doc1.txt", "doc2.pdf"])
-
-        mock_load.assert_called_once_with(["doc1.txt", "doc2.pdf"])
-        mock_chunk.assert_called_once()
-        mock_build.assert_called_once()
-        assert pipeline.vectorstore == mock_vectorstore
-        assert pipeline.chain is not None
-
-    @patch("core.run_rag_query")
-    def test_query(self, mock_run):
-        mock_result = RAGResult(answer="Test answer", citations=[], is_grounded=True)
-        mock_run.return_value = mock_result
-
-        pipeline = RAGPipeline()
-        pipeline.chain = Mock()
-
-        result = pipeline.query("Test question")
-
-        assert result == mock_result
-        mock_run.assert_called_once_with(pipeline.chain, "Test question")
-
-    def test_query_without_index_raises(self):
-        pipeline = RAGPipeline()
-        with pytest.raises(RuntimeError, match="Index not built"):
-            pipeline.query("Test question")
-
-    def test_is_ready(self):
-        pipeline = RAGPipeline()
-        assert pipeline.is_ready() is False
-        pipeline.chain = Mock()
-        assert pipeline.is_ready() is True
-
-
-class TestCitation:
-    def test_to_dict(self):
-        cit = Citation(filename="test.txt", page=5, snippet="Hello world")
-        d = cit.to_dict()
-        assert d == {"filename": "test.txt", "page": 5, "snippet": "Hello world"}
-
-    def test_to_dict_no_page(self):
-        cit = Citation(filename="test.txt", page=None, snippet="Hello")
-        d = cit.to_dict()
-        assert d == {"filename": "test.txt", "page": None, "snippet": "Hello"}
-
-
-class TestNotFoundDetection:
-    def test_exact_not_found_message_triggers_false(self):
-        mock_chain = Mock()
-        mock_chain.invoke.return_value = {
-            "answer": NOT_FOUND_MESSAGE,
-            "citations": [],
-        }
-        result = run_rag_query(mock_chain, "test")
-        assert result.is_grounded is False
-
-    def test_answer_containing_not_found_as_substring(self):
-        mock_chain = Mock()
-        mock_chain.invoke.return_value = {
-            "answer": f"Based on the documents, {NOT_FOUND_MESSAGE}",
-            "citations": [],
-        }
-        result = run_rag_query(mock_chain, "test")
-        assert result.is_grounded is False
+class TestNotFoundSentinel:
+    def test_sentinel_is_expected_string(self):
+        assert NOT_FOUND_SENTINEL == "I don't have enough information in the provided documents to answer that."
